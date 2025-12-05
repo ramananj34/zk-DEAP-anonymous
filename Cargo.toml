@@ -1,0 +1,78 @@
+[package]
+name = "zk-DEAP"
+version = "0.0.0"
+authors = ["Jude Ramanan"]
+edition = "2024"
+description = "Zero Knowledge Decentralized Encrypted Aggregation Protocol"
+repository = "https://github.com/ramananj34/ZK-Disphasia"
+
+[[bin]]
+name = "fixture_server"
+path = "src/bin/azureTestingScripts/fixture_server.rs"
+
+[[bin]]
+name = "test_harness"
+path = "src/bin/azureTestingScripts/test_harness.rs"
+
+[[bin]]
+name = "snark_setup"
+path = "src/bin/azureTestingScripts/snark_setup.rs"
+
+[[bin]]
+name = "snark_param_gen"
+path = "src/bin/utils/param_gen.rs"
+
+[[bin]]
+name = "bulletproof_examples"
+path = "src/bin/examples/bulletproof_examples.rs"
+
+[[bin]]
+name = "snark_examples"
+path = "src/bin/examples/snark_examples.rs"
+
+[[bin]]
+name = "stark_examples"
+path = "src/bin/examples/stark_examples.rs"
+
+[dependencies]
+curve25519-dalek-ng = { version = "4.1", features = ["u64_backend", "serde"], default-features = false } #My curve
+ed25519-dalek = { version = "2.0", features = ["rand_core"] } #Digital signatures
+bulletproofs = "4.0" #Bulletproofs
+merlin = "3.0" #Transcripts
+frost-ristretto255 = "1.0" #FROST
+rand = "0.8" #Random support
+rand_core = "0.6" #Random support
+zeroize = "1.5" #Data deletion
+subtle = "2.5" #Constant time operations
+serde = { version = "1.0", features = ["derive"] } #Serialization/deserialization
+serde_with = "3.14" #Serialization/deserialization
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v2023_04_20" } #Halo2
+blake2b_simd = "1.0" #Transcript
+halo2_gadgets = "0.3"
+winterfell = { version = "0.10", features = ["concurrent"] } #Winterfell
+winter-utils = "0.10" #Winterfell
+winter-prover = "0.10" #Winterfell
+
+#Azure Testing Packages
+actix-web = "4"
+actix-rt = "2"
+base64 = "0.22"
+sha2 = "0.10"
+serde_json = "1"
+rand_chacha = "0.3"
+bincode = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+clap = { version = "4.4", features = ["derive"] }
+chrono = "0.4"
+openssl = { version = "0.10", features = ["vendored"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+overflow-checks = false
+debug = false
+incremental = false
