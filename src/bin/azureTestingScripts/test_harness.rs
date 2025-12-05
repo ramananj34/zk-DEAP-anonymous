@@ -1,7 +1,3 @@
-//This was made with AI Assistance
-
-//! Test Harness for ZK-DISPHASIA Benchmarking - Optimized to avoid redundant testing of shared functions
-
 use serde::{Deserialize, Serialize}; //Serialize/deserialize
 use std::collections::{HashMap, BTreeMap}; //Data structures
 use std::time::Instant; //Timing
