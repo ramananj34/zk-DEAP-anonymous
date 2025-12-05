@@ -28,6 +28,11 @@ It is structured as follows:
     │       │       bullet_example.rs
     │       │       snark_examples.rs
     │       │       stark_examples.rs
+    │       ├───security_tests: Security tests on the library (common methods and one for each implementation)
+    │       │       bullet_penTest.rs
+    │       │       snark_penTest.rs
+    │       │       stark_penTest.rs
+    │       │       common_penTest.rs
     │       └───utils: Helper script to obtain the zk-SNARK public parameters
     |               param_gen.rs
     |

@@ -1,5 +1,5 @@
-use zk_disphasia_azure_test::common::{self, AggError};
-use zk_disphasia_azure_test::bulletproof::IoTDevice;
+use zk_deap::common::{self, AggError};
+use zk_deap::bulletproof::IoTDevice;
 use std::collections::{HashMap, BTreeMap};
 use frost_ristretto255 as frost;
 

@@ -1,5 +1,5 @@
-use zk_disphasia_azure_test::common::{self, AggError};
-use zk_disphasia_azure_test::snark::{IoTDevice, setup_halo2};
+use zk_deap::common::{self, AggError};
+use zk_deap::snark::{IoTDevice, setup_halo2};
 use std::collections::{HashMap, BTreeMap};
 use frost_ristretto255 as frost;
 

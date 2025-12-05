@@ -13,10 +13,10 @@ use base64::Engine; //Base64 encoding
 use frost_ristretto255 as frost; //FROST threshold signatures
 use ed25519_dalek::{VerifyingKey, SigningKey}; //Digital signatures
 
-use zk_disphasia_azure_test::common::{self, VerifiedCiphertext, VerifiedPartial, PartialDecryption}; //Main library imports
-use zk_disphasia_azure_test::bulletproof; //Bulletproof ZKP
-use zk_disphasia_azure_test::snark; //SNARK ZKP
-use zk_disphasia_azure_test::stark; //STARK ZKP
+use zk_deap::common::{self, VerifiedCiphertext, VerifiedPartial, PartialDecryption}; //Main library imports
+use zk_deap::bulletproof; //Bulletproof ZKP
+use zk_deap::snark; //SNARK ZKP
+use zk_deap::stark; //STARK ZKP
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "ZK-DISPHASIA Test Harness")]

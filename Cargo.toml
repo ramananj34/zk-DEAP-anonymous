@@ -1,5 +1,5 @@
 [package]
-name = "zk-DEAP"
+name = "zk-deap"
 version = "0.0.0"
 authors = ["Jude Ramanan"]
 edition = "2024"
@@ -23,8 +23,8 @@ name = "snark_param_gen"
 path = "src/bin/utils/param_gen.rs"
 
 [[bin]]
-name = "bulletproof_examples"
-path = "src/bin/examples/bulletproof_examples.rs"
+name = "bullet_examples"
+path = "src/bin/examples/bullet_examples.rs"
 
 [[bin]]
 name = "snark_examples"
@@ -33,6 +33,22 @@ path = "src/bin/examples/snark_examples.rs"
 [[bin]]
 name = "stark_examples"
 path = "src/bin/examples/stark_examples.rs"
+
+[[bin]]
+name = "common_penTest"
+path = "src/bin/security_tests/common_penTest.rs"
+
+[[bin]]
+name = "bullet_penTest"
+path = "src/bin/security_tests/bullet_penTest.rs"
+
+[[bin]]
+name = "snark_penTest"
+path = "src/bin/security_tests/snark_penTest.rs"
+
+[[bin]]
+name = "stark_penTest"
+path = "src/bin/security_tests/stark_penTest.rs"
 
 [dependencies]
 curve25519-dalek-ng = { version = "4.1", features = ["u64_backend", "serde"], default-features = false } #My curve
@@ -65,7 +81,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["blocking", "json"] }
 clap = { version = "4.4", features = ["derive"] }
 chrono = "0.4"
-openssl = { version = "0.10", features = ["vendored"] }
+#openssl = { version = "0.10", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3

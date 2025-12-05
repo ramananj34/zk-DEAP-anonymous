@@ -12,10 +12,10 @@ use curve25519_dalek_ng::{ristretto::{RistrettoPoint}, scalar::Scalar, traits::I
 use base64::{Engine as _, engine::general_purpose}; //Base64 encoding
 
 //Import from the main library (assumed to be in the same crate)
-use zk_disphasia_azure_test::common::{self, AggError, VerifiedCiphertext};
-use zk_disphasia_azure_test::bulletproof;
-use zk_disphasia_azure_test::snark;
-use zk_disphasia_azure_test::stark;
+use zk_deap::common::{self, AggError, VerifiedCiphertext};
+use zk_deap::bulletproof;
+use zk_deap::snark;
+use zk_deap::stark;
 
 //Network configurations to test
 const NETWORK_SIZES: &[usize] = &[5, 10, 20, 50, 100, 250, 500]; //Test network sizes
