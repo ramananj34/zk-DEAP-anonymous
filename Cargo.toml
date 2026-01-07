@@ -1,10 +1,9 @@
 [package]
 name = "zk-deap"
 version = "0.0.0"
-authors = ["Jude Ramanan"]
+authors = ["Anonymous"]
 edition = "2024"
 description = "Zero Knowledge Decentralized Encrypted Aggregation Protocol"
-repository = "https://github.com/ramananj34/zk-DEAP"
 
 [[bin]]
 name = "fixture_server"
