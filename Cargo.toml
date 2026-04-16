@@ -1,6 +1,7 @@
 [package]
 name = "zk-deap"
 version = "0.0.0"
+authors = ["Anonymous"]
 edition = "2024"
 description = "Zero Knowledge Decentralized Encrypted Aggregation Protocol"
 
