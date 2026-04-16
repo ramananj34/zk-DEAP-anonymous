@@ -14,25 +14,85 @@ use std::collections::{HashMap, HashSet}; //Data structures
 use crate::common::{SerCompressed, SerScalar, AggError, VerifiedCiphertext, VerifiedPartial, PartialDecryption, PROTOCOL_VERSION, MAX_DEVICES, MAX_STORED_PROOFS, MAX_CLOCK_SKEW,MAX_NONCES_PER_DEVICE, PROOF_EXPIRY, timestamp, frost_to_point, check_rate};
 
 const MAX_PROOF_SIZE: usize = 65536; //prevent DoS attacks
+const TRACE_LENGTH: usize = 64;
+const MIMC_ROUNDS: usize = TRACE_LENGTH - 1; //63 rounds, one per transition
+
+//Public MiMC round constants (nothing-up-my-sleeve, from BLAKE3)
+fn mimc_round_constants() -> [BaseElement; TRACE_LENGTH] {
+    let mut rc = [BaseElement::ZERO; TRACE_LENGTH];
+    for i in 0..TRACE_LENGTH {
+        let label = format!("zk-DEAP-MiMC-rc-{}", i);
+        let h = blake3::hash(label.as_bytes());
+        let bytes = h.as_bytes();
+        let mut val: u128 = 0;
+        for j in 0..16 { val |= (bytes[j] as u128) << (j * 8); }
+        rc[i] = BaseElement::new(val);
+    }
+    rc
+}
+
+//MiMC_63 hash: x_{i+1} = (x_i + s + eps + b + rc_i)^5 for i in 0..63
+fn mimc_hash(v_f: BaseElement, s: BaseElement, eps: BaseElement, b: BaseElement) -> BaseElement {
+    let rc = mimc_round_constants();
+    let mut x = v_f;
+    for i in 0..MIMC_ROUNDS {
+        let sum = x + s + eps + b + rc[i];
+        let sq = sum * sum;
+        x = sq * sq * sum; // x^5
+    }
+    x
+}
+
+//Encode a 32-byte compressed Ristretto point as F_p via XOR-fold
+pub fn point_to_field_element(bytes: &[u8; 32]) -> BaseElement {
+    let mut val: u128 = 0;
+    for i in 0..16 { val |= ((bytes[i] ^ bytes[i + 16]) as u128) << (i * 8); }
+    BaseElement::new(val)
+}
+
+//Reduce Ristretto scalar (Z_q, q ~ 2^252) to F_p where p = 2^128 - 45*2^40 + 1. Uses s = s_lo + s_hi * 2^128 and 2^128 mod p = 45*2^40 - 1.
+fn scalar_to_field_element(s: &Scalar) -> BaseElement {
+    let bytes = s.to_bytes();
+    let mut s_lo: u128 = 0;
+    let mut s_hi: u128 = 0;
+    for i in 0..16 {
+        s_lo |= (bytes[i] as u128) << (i * 8);
+        s_hi |= (bytes[i + 16] as u128) << (i * 8);
+    }
+    let lo = BaseElement::new(s_lo);
+    let hi = BaseElement::new(s_hi);
+    let two_128_mod_p = BaseElement::new(45u128 * (1u128 << 40) - 1);
+    lo + hi * two_128_mod_p
+}
+
+//q mod p, precomputed via Scalar arithmetic (q - 1 mod p, then add 1)
+fn q_mod_p() -> BaseElement {
+    scalar_to_field_element(&(-Scalar::one())) + BaseElement::ONE
+}
 
 
 //STARK AIR definition - enforces binary constraint
 #[derive(Clone, Debug)]
 pub struct BinaryPublicInputs {
-    state_commitment: BaseElement, //Public state
-    nonce_public: BaseElement, //Public nonce
-    pedersen_public: BaseElement, //Public pedersen
+    pub v_commit: BaseElement,
+    pub epsilon: BaseElement,
+    pub resp_f: BaseElement,
+    pub c_f: BaseElement,
+    pub omega: BaseElement,
 }
 //Convert to linear array for STARK framework
-impl ToElements<BaseElement> for BinaryPublicInputs { fn to_elements(&self) -> Vec<BaseElement> { vec![self.state_commitment, self.nonce_public, self.pedersen_public] } }
+impl ToElements<BaseElement> for BinaryPublicInputs { fn to_elements(&self) -> Vec<BaseElement> { vec![self.v_commit, self.epsilon, self.resp_f, self.c_f, self.omega] } }
 //AIR Algebraic Intermediate Representation. This defines the constraint that state * (state - 1) = 0
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct BinaryAir {
     context: AirContext<BaseElement>,
-    state_commitment: BaseElement,
-    nonce_public: BaseElement,
-    pedersen_public: BaseElement,
+    v_commit: BaseElement,
+    epsilon: BaseElement,
+    resp_f: BaseElement,
+    c_f: BaseElement,
+    omega: BaseElement,
+    q_mod_p: BaseElement,
 }
 impl Air for BinaryAir {
     type BaseField = BaseElement;
@@ -40,80 +100,114 @@ impl Air for BinaryAir {
     type GkrProof = ();
     type GkrVerifier = ();
     fn new(trace_info: TraceInfo, pub_inputs: Self::PublicInputs, opts: ProofOptions) -> Self {
-        assert_eq!(4, trace_info.width());
-        //Binary and Hash Constraint
-        let degrees = vec![ TransitionConstraintDegree::new(2), TransitionConstraintDegree::new(5)];
+        assert_eq!(5, trace_info.width());
+        let degrees = vec![
+            TransitionConstraintDegree::new(2), //C0 binary
+            TransitionConstraintDegree::with_cycles(5, vec![TRACE_LENGTH]), //C1 MiMC (periodic rc)
+            TransitionConstraintDegree::new(1), //C2 s constancy
+            TransitionConstraintDegree::new(1), //C3 eps constancy
+            TransitionConstraintDegree::new(1), //C4 b constancy
+            TransitionConstraintDegree::new(1), //C5 schnorr aux
+        ];
         Self {
             context: AirContext::new(trace_info, degrees, 3, opts),
-            state_commitment: pub_inputs.state_commitment,
-            nonce_public: pub_inputs.nonce_public,
-            pedersen_public: pub_inputs.pedersen_public,
+            v_commit: pub_inputs.v_commit,
+            epsilon: pub_inputs.epsilon,
+            resp_f: pub_inputs.resp_f,
+            c_f: pub_inputs.c_f,
+            omega: pub_inputs.omega,
+            q_mod_p: q_mod_p(),
         }
     }
     fn context(&self) -> &AirContext<Self::BaseField> { &self.context }
-    fn evaluate_transition<E: FieldElement + From<Self::BaseField>>( &self, frame: &EvaluationFrame<E>, _: &[E], result: &mut [E] ) {
-        let current = frame.current();
-        let state = current[0];
-        let nonce = current[1];
-        let pedersen = current[2];
-        let hash_val = current[3];
-        //Constraint 1: Binary constraint
-        result[0] = state * (state - E::ONE);
-        //Constraint 2: Hash constraint
-        let state_sq = state * state;
-        let state_5 = state_sq * state_sq * state;
-        let nonce_sq = nonce * nonce;
-        let nonce_5 = nonce_sq * nonce_sq * nonce;
-        let pedersen_sq = pedersen * pedersen;
-        let pedersen_5 = pedersen_sq * pedersen_sq * pedersen;
-        let expected_hash = state_5 + nonce_5 + pedersen_5 + (state * nonce) + (state * pedersen);
-        result[1] = hash_val - expected_hash;
+    fn evaluate_transition<E: FieldElement + From<Self::BaseField>>(&self, frame: &EvaluationFrame<E>, periodic_values: &[E], result: &mut [E]) {
+        let cur = frame.current();
+        let nxt = frame.next();
+        let rc_i = periodic_values[0];
+        let c_f = E::from(self.c_f);
+        let omega = E::from(self.omega);
+        let q_mp = E::from(self.q_mod_p);
+        let s = cur[0];
+        let m = cur[1];
+        let eps = cur[2];
+        let b = cur[3];
+        let aux = cur[4];
+        //C0: binary
+        result[0] = s * (s - E::ONE);
+        //C1: MiMC round  m_{i+1} = (m_i + s + eps + b + rc_i)^5
+        let sum = m + s + eps + b + rc_i;
+        let sq = sum * sum;
+        let pow5 = sq * sq * sum;
+        result[1] = nxt[1] - pow5;
+        //C2..C4: constancy
+        result[2] = nxt[0] - s;
+        result[3] = nxt[2] - eps;
+        result[4] = nxt[3] - b;
+        //C5: schnorr aux  T[4,i] = T[1,i] + c_f * T[0,i]
+        result[5] = aux - m - c_f * s + omega * q_mp * s;
     }
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
-        vec![Assertion::single(3, 63, self.state_commitment),Assertion::single(1, 63, self.nonce_public),Assertion::single(2, 63, self.pedersen_public)]
+        vec![Assertion::single(1, TRACE_LENGTH - 1, self.v_commit), Assertion::single(2, 0, self.epsilon), Assertion::single(4, 0, self.resp_f) ]
+    }
+    fn get_periodic_column_values(&self) -> Vec<Vec<Self::BaseField>> {
+        vec![mimc_round_constants().to_vec()]
     }
 }
 //STARK prover implementation
 #[derive(Clone)]
 pub struct BinaryProver {
     pub options: ProofOptions,
-    last_state: std::cell::Cell<Option<BaseElement>>,
-    last_nonce: std::cell::Cell<Option<BaseElement>>,
-    last_pedersen: std::cell::Cell<Option<BaseElement>>,
-    last_commitment: std::cell::Cell<Option<BaseElement>>,
+    last_v_commit: std::cell::Cell<Option<BaseElement>>,
+    last_epsilon: std::cell::Cell<Option<BaseElement>>,
+    last_resp_f: std::cell::Cell<Option<BaseElement>>,
+    last_c_f: std::cell::Cell<Option<BaseElement>>,
+    last_omega: std::cell::Cell<Option<BaseElement>>,
 }
 impl BinaryProver {
     pub fn new() -> Self {
         Self {
-            options: ProofOptions::new(40,16,20,winterfell::FieldExtension::None,8,63),
-            last_state: std::cell::Cell::new(None),
-            last_nonce: std::cell::Cell::new(None),
-            last_pedersen: std::cell::Cell::new(None),
-            last_commitment: std::cell::Cell::new(None),
+            options: ProofOptions::new(40, 16, 20, winterfell::FieldExtension::None, 8, 63),
+            last_v_commit: std::cell::Cell::new(None),
+            last_epsilon: std::cell::Cell::new(None),
+            last_resp_f: std::cell::Cell::new(None),
+            last_c_f: std::cell::Cell::new(None),
+            last_omega: std::cell::Cell::new(None),
         }
     }
-    pub fn build_trace(&self, state: u8, nonce: BaseElement, pedersen: BaseElement) -> TraceTable<BaseElement> {
-        let state_elem = BaseElement::new(state as u128);
-        //Compute hash
-        let state_sq = state_elem * state_elem;
-        let state_5 = state_sq * state_sq * state_elem;
-        let nonce_sq = nonce * nonce;
-        let nonce_5 = nonce_sq * nonce_sq * nonce;
-        let pedersen_sq = pedersen * pedersen;
-        let pedersen_5 = pedersen_sq * pedersen_sq * pedersen;
-        let hash = state_5 + nonce_5 + pedersen_5 + (state_elem * nonce) + (state_elem * pedersen);
-        //Store result
-        self.last_state.set(Some(state_elem));
-        self.last_nonce.set(Some(nonce));
-        self.last_pedersen.set(Some(pedersen));
-        self.last_commitment.set(Some(hash));
-        //Trace length
-        let len = 64;
-        let mut trace = TraceTable::new(4, len);
-        //Trace
+    pub fn build_trace(&self, state: u8, v_f: BaseElement, epsilon: BaseElement, blinding: BaseElement, resp_f: BaseElement, c_f: BaseElement, omega: BaseElement) -> TraceTable<BaseElement> {
+        let s_elem = BaseElement::new(state as u128);
+        let rc = mimc_round_constants();
+        let q_mp = q_mod_p();
+        let mut mimc = vec![BaseElement::ZERO; TRACE_LENGTH];
+        mimc[0] = v_f;
+        for i in 0..MIMC_ROUNDS {
+            let sum = mimc[i] + s_elem + epsilon + blinding + rc[i];
+            let sq = sum * sum;
+            mimc[i + 1] = sq * sq * sum;
+        }
+        let v_commit = mimc[TRACE_LENGTH - 1];
+        self.last_v_commit.set(Some(v_commit));
+        self.last_epsilon.set(Some(epsilon));
+        self.last_resp_f.set(Some(resp_f));
+        self.last_c_f.set(Some(c_f));
+        self.last_omega.set(Some(omega));
+        let mut trace = TraceTable::new(5, TRACE_LENGTH);
         trace.fill(
-            |s| {s[0] = BaseElement::ZERO;s[1] = BaseElement::ZERO;s[2] = BaseElement::ZERO;s[3] = BaseElement::ZERO;},
-            |step, s| {if step == 0 {s[0] = state_elem;s[1] = nonce;s[2] = pedersen;s[3] = hash;} else {s[0] = state_elem;s[1] = nonce;s[2] = pedersen;s[3] = hash;}}
+            |row| {
+                row[0] = s_elem;
+                row[1] = v_f;
+                row[2] = epsilon;
+                row[3] = blinding;
+                row[4] = v_f + c_f * s_elem - omega * q_mp * s_elem; //= resp_f at row 0
+            },
+            |step, row| {
+                let m_next = mimc[step + 1];
+                row[0] = s_elem;
+                row[1] = m_next;
+                row[2] = epsilon;
+                row[3] = blinding;
+                row[4] = m_next + c_f * s_elem - omega * q_mp * s_elem;
+            },
         );
         trace
     }
@@ -130,9 +224,11 @@ impl Prover for BinaryProver {
     type ConstraintEvaluator<'a, E: FieldElement<BaseField = Self::BaseField>> = DefaultConstraintEvaluator<'a, Self::Air, E>;
     fn get_pub_inputs(&self, _: &Self::Trace) -> BinaryPublicInputs {
         BinaryPublicInputs {
-            state_commitment: self.last_commitment.get().unwrap(),
-            nonce_public: self.last_nonce.get().unwrap(),
-            pedersen_public: self.last_pedersen.get().unwrap(),
+            v_commit: self.last_v_commit.get().unwrap(),
+            epsilon: self.last_epsilon.get().unwrap(),
+            resp_f: self.last_resp_f.get().unwrap(),
+            c_f: self.last_c_f.get().unwrap(),
+            omega: self.last_omega.get().unwrap(),
         }
     }
     fn options(&self) -> &ProofOptions { &self.options }
@@ -147,102 +243,75 @@ impl Prover for BinaryProver {
 //ElGamal correctness proof
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElGamalProof {
-    pub commit_r: SerCompressed, //Random witness var
-    pub commit_s: SerCompressed, //Random witness var
-    pub commit_p: SerCompressed, //Random witness var
-    pub resp_r: SerScalar, //Fiat Shamir Response
-    pub resp_state: SerScalar, //Fiat Shamir Response
-    pub pedersen_commit: SerCompressed, //Fiat Shamir Response
-    pub nonce_bytes: [u8; 32], //Replay salt
+    pub commit_r: SerCompressed,
+    pub commit_s: SerCompressed,
+    pub commit_p: SerCompressed,
+    pub resp_r: SerScalar,
+    pub resp_state: SerScalar,
+    pub pedersen_commit: SerCompressed
 }
 impl ElGamalProof {
-    pub fn prove(state: u8, r: &Scalar, c1: &RistrettoPoint, c2: &RistrettoPoint, h: &RistrettoPoint, dev_id: u32, ts: u64) -> Self {
-        //Setup
+    //Schnorr prove with caller-supplied nonce v. V_commit is bound into the transcript before challenge derivation. Returns (proof, challenge).
+    pub fn prove_with_nonce(state: u8, r: &Scalar, v: &Scalar, c1: &RistrettoPoint, c2: &RistrettoPoint, h: &RistrettoPoint, dev_id: u32, ts: u64, v_commit_bytes: &[u8; 16] ) -> (Self, Scalar) {
         let g = RISTRETTO_BASEPOINT_POINT;
-        let state_scalar = Scalar::from(state as u64);
-        let pedersen_commit = g * state_scalar + h * r;
-        //Get randomness
-        let mut nonce_bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        let s_scalar = Scalar::from(state as u64);
+        let pedersen = g * s_scalar + h * r;
         let mut w = Scalar::random(&mut OsRng);
-        let mut v = Scalar::random(&mut OsRng);
-        //Compute commitments
         let cr = g * w;
         let cs = g * v + h * w;
         let cp = g * v + h * w;
-        //Build transcript
-        let mut t = Transcript::new(b"elgamal-pedersen");
+        let mut t = Transcript::new(b"elgamal-pedersen-v2");
         t.append_message(b"protocol_version", &[PROTOCOL_VERSION]);
         t.append_u64(b"device", dev_id as u64);
         t.append_u64(b"timestamp", ts);
-        t.append_message(b"nonce", &nonce_bytes);
         t.append_message(b"c1", c1.compress().as_bytes());
         t.append_message(b"c2", c2.compress().as_bytes());
-        t.append_message(b"pedersen", pedersen_commit.compress().as_bytes());
+        t.append_message(b"pedersen", pedersen.compress().as_bytes());
         t.append_message(b"R", cr.compress().as_bytes());
         t.append_message(b"S", cs.compress().as_bytes());
         t.append_message(b"P", cp.compress().as_bytes());
-        //Derive challange
+        t.append_message(b"v_commit", v_commit_bytes);
         let mut cb = [0u8; 64];
         t.challenge_bytes(b"challenge", &mut cb);
         let c = Scalar::from_bytes_mod_order_wide(&cb);
-        //Compute response
-        let result = Self {
+        let proof = Self {
             commit_r: cr.compress().into(),
             commit_s: cs.compress().into(),
             commit_p: cp.compress().into(),
             resp_r: (w + c * r).into(),
-            resp_state: (v + c * state_scalar).into(),
-            pedersen_commit: pedersen_commit.compress().into(),
-            nonce_bytes,
+            resp_state: (v + c * s_scalar).into(),
+            pedersen_commit: pedersen.compress().into(),
         };
-        //Zeroize secrets
         w.zeroize();
-        v.zeroize();
-        result
+        (proof, c)
     }
 
-    pub fn verify(&self, c1: &RistrettoPoint, c2: &RistrettoPoint, h: &RistrettoPoint, dev_id: u32, ts: u64) -> bool {
-        //Decompress
+    pub fn verify(&self, c1: &RistrettoPoint, c2: &RistrettoPoint, h: &RistrettoPoint, dev_id: u32, ts: u64, v_commit_bytes: &[u8; 16] ) -> bool {
         let g = RISTRETTO_BASEPOINT_POINT;
-        let (Some(cr), Some(cs), Some(cp), Some(pc)) = (self.commit_r.0.decompress(), self.commit_s.0.decompress(),self.commit_p.0.decompress(),self.pedersen_commit.0.decompress()) else { return false };
-        //Rebuild transcript
-        let mut t = Transcript::new(b"elgamal-pedersen");
+        let (Some(cr), Some(cs), Some(cp), Some(pc)) = (
+            self.commit_r.0.decompress(),
+            self.commit_s.0.decompress(),
+            self.commit_p.0.decompress(),
+            self.pedersen_commit.0.decompress(),
+        ) else { return false };
+        let mut t = Transcript::new(b"elgamal-pedersen-v2");
         t.append_message(b"protocol_version", &[PROTOCOL_VERSION]);
         t.append_u64(b"device", dev_id as u64);
         t.append_u64(b"timestamp", ts);
-        t.append_message(b"nonce", &self.nonce_bytes);
         t.append_message(b"c1", c1.compress().as_bytes());
         t.append_message(b"c2", c2.compress().as_bytes());
         t.append_message(b"pedersen", self.pedersen_commit.0.as_bytes());
         t.append_message(b"R", self.commit_r.0.as_bytes());
         t.append_message(b"S", self.commit_s.0.as_bytes());
         t.append_message(b"P", self.commit_p.0.as_bytes());
-        //Derive challange
+        t.append_message(b"v_commit", v_commit_bytes);
         let mut cb = [0u8; 64];
         t.challenge_bytes(b"challenge", &mut cb);
         let c = Scalar::from_bytes_mod_order_wide(&cb);
-        //Perform checks
         let chk1 = g * self.resp_r.0 == cr + c1 * c;
         let chk2 = g * self.resp_state.0 + h * self.resp_r.0 == cs + c2 * c;
         let chk3 = g * self.resp_state.0 + h * self.resp_r.0 == cp + pc * c;
         chk1 && chk2 && chk3
-    }
-
-    pub fn compute_stark_commitment(state: u8, nonce: &[u8; 32], pedersen: &CompressedRistretto) -> BaseElement {
-        //Inputs to field elements
-        let state_elem = BaseElement::new(state as u128);
-        let nonce_elem = bytes_to_base_element(nonce);
-        let pedersen_elem = bytes_to_base_element(pedersen.as_bytes());
-        //Compute non-linear hashes, then raises to the fifth power for entropy, a pseudo-hash in the finite field
-        let s_sq = state_elem * state_elem;
-        let s_5 = s_sq * s_sq * state_elem;
-        let n_sq = nonce_elem * nonce_elem;
-        let n_5 = n_sq * n_sq * nonce_elem;
-        let p_sq = pedersen_elem * pedersen_elem;
-        let p_5 = p_sq * p_sq * pedersen_elem;
-        //Mix everything together
-        s_5 + n_5 + p_5 + (state_elem * nonce_elem) + (state_elem * pedersen_elem)
     }
 }
 
@@ -250,15 +319,18 @@ impl ElGamalProof {
 #[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceProof {
-    pub device_id: u32, //Device ID
-    pub timestamp: u64, //Timestamp
-    pub elgamal_c1: SerCompressed, //ElGamal
-    pub elgamal_c2: SerCompressed, //ElGamal
-    pub elgamal_proof: ElGamalProof, //ElGamal
-    pub stark_commitment: Vec<u8>, //Stark
-    pub stark_proof: Vec<u8>, //Stark
+    pub device_id: u32,
+    pub timestamp: u64,
+    pub elgamal_c1: SerCompressed,
+    pub elgamal_c2: SerCompressed,
+    pub elgamal_proof: ElGamalProof,
+    pub v_commit: [u8; 16],
+    pub resp_f: [u8; 16],
+    pub c_f: [u8; 16],
+    pub omega: u8,
+    pub stark_proof: Vec<u8>,
     #[serde_as(as = "Bytes")]
-    pub signature: [u8; 64], //Signature
+    pub signature: [u8; 64],
 }
 
 //Main device struct - handles proof generation/verification and aggregation
@@ -276,7 +348,7 @@ pub struct IoTDevice {
     stark_prover: BinaryProver,
     threshold: usize,
     rates: HashMap<u32, (u64, u32)>,
-    seen_nonces: HashMap<u32, HashSet<[u8; 32]>>,
+    seen_nonces: HashMap<u32, HashSet<[u8; 16]>>,
 }
 
 impl IoTDevice {
@@ -307,74 +379,150 @@ impl IoTDevice {
     //Generate proof for our state (0 or 1)
     pub fn generate_proof(&self, state: u8) -> Result<DeviceProof, AggError> {
         if state > 1 { return Err(AggError::CryptoError("State must be 0/1".into())); }
-        //Setup
         let ts = timestamp();
         let mut r = Scalar::random(&mut OsRng);
         let g = RISTRETTO_BASEPOINT_POINT;
         let h = frost_to_point(&self.group_pub.verifying_key())?;
-        //ElGamal encrypt
-        let (c1, c2) = (g * r, g * Scalar::from(state as u64) + h * r);
-        //Generate ElGamal proof
-        let eg_proof = ElGamalProof::prove(state, &r, &c1, &c2, &h, self.id, ts);
-        //Compute STARK commitment
-        let commitment = ElGamalProof::compute_stark_commitment(state, &eg_proof.nonce_bytes, &eg_proof.pedersen_commit.0);
-        let commitment_bytes = commitment.as_int().to_le_bytes().to_vec();
-        //Build STARK trace
-        let nonce_elem = bytes_to_base_element(&eg_proof.nonce_bytes);
-        let pedersen_elem = bytes_to_base_element(eg_proof.pedersen_commit.0.as_bytes());
-        let trace = self.stark_prover.build_trace(state, nonce_elem, pedersen_elem);
-        //Stark Proof
-        let stark_proof = self.stark_prover.prove(trace).map_err(|e| { r.zeroize(); AggError::CryptoError(format!("STARK failed: {:?}", e)) })?;
-        let mut bytes = Vec::new();
-        stark_proof.write_into(&mut bytes);
+        let s_scalar = Scalar::from(state as u64);
+        let c1 = g * r;
+        let c2 = g * s_scalar + h * r;
+        let pedersen_bytes: [u8; 32] = c2.compress().to_bytes();
+        let epsilon = point_to_field_element(&pedersen_bytes);
+        let mut b_bytes = [0u8; 16];
+        OsRng.fill_bytes(&mut b_bytes);
+        let blinding = BaseElement::new(u128::from_le_bytes(b_bytes));
+        let v = Scalar::random(&mut OsRng);
+        let v_f = scalar_to_field_element(&v);
+        let s_elem = BaseElement::new(state as u128);
+        let v_commit_elem = mimc_hash(v_f, s_elem, epsilon, blinding);
+        let v_commit_bytes: [u8; 16] = v_commit_elem.as_int().to_le_bytes();
+        let (eg_proof, challenge) = ElGamalProof::prove_with_nonce(state, &r, &v, &c1, &c2, &h, self.id, ts, &v_commit_bytes);
+        //omega: carry bit in {0,1}. For state=0 no addition happens so omega=0. For state=1, omega=1 iff v+c >= q as integers, equivalently (v+c) mod q < v in canonical LE order.
+        let omega = if state == 1 {
+            let sum = v + challenge;
+            let sum_b = sum.to_bytes();
+            let v_b = v.to_bytes();
+            let mut wrap = false;
+            for i in (0..32).rev() {
+                if sum_b[i] < v_b[i] { wrap = true; break; }
+                if sum_b[i] > v_b[i] { break; }
+            }
+            if wrap { BaseElement::ONE } else { BaseElement::ZERO }
+        } else {
+            BaseElement::ZERO
+        };
+        let resp_f = scalar_to_field_element(&eg_proof.resp_state.0);
+        let c_f    = scalar_to_field_element(&challenge);
+        let trace = self.stark_prover.build_trace(state, v_f, epsilon, blinding, resp_f, c_f, omega);
+        let stark_proof = self.stark_prover.prove(trace).map_err(|e| {r.zeroize();AggError::CryptoError(format!("STARK failed: {:?}", e))})?;
+        let mut stark_bytes = Vec::new();
+        stark_proof.write_into(&mut stark_bytes);
         r.zeroize();
+        let resp_f_bytes: [u8; 16] = resp_f.as_int().to_le_bytes();
+        let c_f_bytes: [u8; 16] = c_f.as_int().to_le_bytes();
+        let omega_byte: u8 = if omega == BaseElement::ONE { 1 } else { 0 };
+        let mut sig_data = Vec::new();
+        sig_data.extend_from_slice(&ts.to_le_bytes());
+        sig_data.extend_from_slice(&self.id.to_le_bytes());
+        sig_data.extend_from_slice(c1.compress().as_bytes());
+        sig_data.extend_from_slice(c2.compress().as_bytes());
+        sig_data.extend_from_slice(eg_proof.pedersen_commit.0.as_bytes());
+        sig_data.extend_from_slice(eg_proof.commit_r.0.as_bytes());
+        sig_data.extend_from_slice(eg_proof.commit_s.0.as_bytes());
+        sig_data.extend_from_slice(eg_proof.commit_p.0.as_bytes());
+        sig_data.extend_from_slice(&eg_proof.resp_r.0.to_bytes());
+        sig_data.extend_from_slice(&eg_proof.resp_state.0.to_bytes());
+        sig_data.extend_from_slice(&v_commit_bytes);
+        sig_data.extend_from_slice(&resp_f_bytes);
+        sig_data.extend_from_slice(&c_f_bytes);
+        sig_data.push(omega_byte);
+        let signature = self.sig_key.sign(&sig_data).to_bytes();
         Ok(DeviceProof {
             device_id: self.id, timestamp: ts,
-            elgamal_c1: c1.compress().into(), elgamal_c2: c2.compress().into(),
-            elgamal_proof: eg_proof.clone(), stark_commitment: commitment_bytes,
-            stark_proof: bytes,
-            signature: {let mut sig_data = Vec::new();sig_data.extend_from_slice(&ts.to_le_bytes());sig_data.extend_from_slice(&self.id.to_le_bytes());sig_data.extend_from_slice(&eg_proof.nonce_bytes);sig_data.extend_from_slice(c1.compress().as_bytes());sig_data.extend_from_slice(c2.compress().as_bytes());sig_data.extend_from_slice(eg_proof.pedersen_commit.0.as_bytes());sig_data.extend_from_slice(eg_proof.commit_r.0.as_bytes());sig_data.extend_from_slice(eg_proof.commit_s.0.as_bytes());sig_data.extend_from_slice(eg_proof.commit_p.0.as_bytes());sig_data.extend_from_slice(&eg_proof.resp_r.0.to_bytes());sig_data.extend_from_slice(&eg_proof.resp_state.0.to_bytes());sig_data.extend_from_slice(&commitment.as_int().to_le_bytes());self.sig_key.sign(&sig_data).to_bytes()},
+            elgamal_c1: c1.compress().into(),
+            elgamal_c2: c2.compress().into(),
+            elgamal_proof: eg_proof,
+            v_commit: v_commit_bytes,
+            resp_f: resp_f_bytes,
+            c_f: c_f_bytes,
+            omega: omega_byte,
+            stark_proof: stark_bytes,
+            signature,
         })
     }
 
     //Receive and verify a proof from a peer
     pub fn receive_proof(&mut self, p: DeviceProof) -> Result<(), AggError> {
-        //Auto-cleanup if storage limits exceeded
         if self.verified_ciphertexts.len() >= MAX_STORED_PROOFS {
             self.cleanup();
-            if self.verified_ciphertexts.len() >= MAX_STORED_PROOFS {return Err(AggError::RateLimited);}
+            if self.verified_ciphertexts.len() >= MAX_STORED_PROOFS {
+                return Err(AggError::RateLimited);
+            }
         }
-        //DoS Checks
         check_rate(p.device_id, &mut self.rates)?;
         let now = timestamp();
-        let adjusted_now = now + MAX_CLOCK_SKEW;
-        if p.timestamp > adjusted_now { return Err(AggError::InvalidProof("Timestamp too far in future".into())); }
-        if p.timestamp + PROOF_EXPIRY < now.saturating_sub(MAX_CLOCK_SKEW) { return Err(AggError::ExpiredProof); }
+        if p.timestamp > now + MAX_CLOCK_SKEW {
+            return Err(AggError::InvalidProof("Timestamp too far in future".into()));
+        }
+        if p.timestamp + PROOF_EXPIRY < now.saturating_sub(MAX_CLOCK_SKEW) {
+            return Err(AggError::ExpiredProof);
+        }
         let device_nonces = self.seen_nonces.entry(p.device_id).or_insert_with(HashSet::new);
-        if device_nonces.len() >= MAX_NONCES_PER_DEVICE { return Err(AggError::RateLimited); }
-        if !device_nonces.insert(p.elgamal_proof.nonce_bytes) { return Err(AggError::InvalidProof("Nonce already used".into())); }
-        if self.verified_ciphertexts.contains_key(&p.device_id) { return Err(AggError::InvalidProof("Duplicate".into())); }
-        if p.stark_proof.len() > MAX_PROOF_SIZE { return Err(AggError::InvalidProof("Too big".into())); }
-        //Verify signature
-        let pk = self.peer_keys.get(&p.device_id).ok_or(AggError::InvalidProof("Unknown device".into()))?; {if p.stark_commitment.len() != 16 { return Err(AggError::InvalidProof("Bad commitment size".into()));}let mut commitment_bytes = [0u8; 16];commitment_bytes.copy_from_slice(&p.stark_commitment);let mut sig_data = Vec::new();sig_data.extend_from_slice(&p.timestamp.to_le_bytes());sig_data.extend_from_slice(&p.device_id.to_le_bytes());sig_data.extend_from_slice(&p.elgamal_proof.nonce_bytes);sig_data.extend_from_slice(p.elgamal_c1.0.as_bytes());sig_data.extend_from_slice(p.elgamal_c2.0.as_bytes());sig_data.extend_from_slice(p.elgamal_proof.pedersen_commit.0.as_bytes());sig_data.extend_from_slice(p.elgamal_proof.commit_r.0.as_bytes());sig_data.extend_from_slice(p.elgamal_proof.commit_s.0.as_bytes());sig_data.extend_from_slice(p.elgamal_proof.commit_p.0.as_bytes());sig_data.extend_from_slice(&p.elgamal_proof.resp_r.0.to_bytes());sig_data.extend_from_slice(&p.elgamal_proof.resp_state.0.to_bytes());sig_data.extend_from_slice(&commitment_bytes);let sig = Signature::try_from(&p.signature[..]).map_err(|_| AggError::InvalidProof("bad sig".into()))?;pk.verify(&sig_data, &sig).map_err(|_| AggError::InvalidProof("sig verify failed".into()))?;}
-        //Verify ElGamal correctness proof
+        if device_nonces.len() >= MAX_NONCES_PER_DEVICE {
+            return Err(AggError::RateLimited);
+        }
+        if !device_nonces.insert(p.v_commit) {
+            return Err(AggError::InvalidProof("Nonce already used".into()));
+        }
+        if self.verified_ciphertexts.contains_key(&p.device_id) {
+            return Err(AggError::InvalidProof("Duplicate".into()));
+        }
+        if p.stark_proof.len() > MAX_PROOF_SIZE {
+            return Err(AggError::InvalidProof("Too big".into()));
+        }
+        if p.omega > 1 {
+            return Err(AggError::InvalidProof("Bad omega".into()));
+        }
+        let pk = self.peer_keys.get(&p.device_id).ok_or(AggError::InvalidProof("Unknown device".into()))?;
+        let mut sig_data = Vec::new();
+        sig_data.extend_from_slice(&p.timestamp.to_le_bytes());
+        sig_data.extend_from_slice(&p.device_id.to_le_bytes());
+        sig_data.extend_from_slice(p.elgamal_c1.0.as_bytes());
+        sig_data.extend_from_slice(p.elgamal_c2.0.as_bytes());
+        sig_data.extend_from_slice(p.elgamal_proof.pedersen_commit.0.as_bytes());
+        sig_data.extend_from_slice(p.elgamal_proof.commit_r.0.as_bytes());
+        sig_data.extend_from_slice(p.elgamal_proof.commit_s.0.as_bytes());
+        sig_data.extend_from_slice(p.elgamal_proof.commit_p.0.as_bytes());
+        sig_data.extend_from_slice(&p.elgamal_proof.resp_r.0.to_bytes());
+        sig_data.extend_from_slice(&p.elgamal_proof.resp_state.0.to_bytes());
+        sig_data.extend_from_slice(&p.v_commit);
+        sig_data.extend_from_slice(&p.resp_f);
+        sig_data.extend_from_slice(&p.c_f);
+        sig_data.push(p.omega);
+        let sig = Signature::try_from(&p.signature[..]).map_err(|_| AggError::InvalidProof("bad sig".into()))?;
+        pk.verify(&sig_data, &sig).map_err(|_| AggError::InvalidProof("sig verify failed".into()))?;
         let c1 = p.elgamal_c1.0.decompress().ok_or(AggError::InvalidProof("bad c1".into()))?;
         let c2 = p.elgamal_c2.0.decompress().ok_or(AggError::InvalidProof("bad c2".into()))?;
         let h = frost_to_point(&self.group_pub.verifying_key())?;
-        if !p.elgamal_proof.verify(&c1, &c2, &h, p.device_id, p.timestamp) { return Err(AggError::InvalidProof("Schnorr failed".into())); }
-        //Verify STARK proof
-        let mut commitment_bytes = [0u8; 16];
-        commitment_bytes.copy_from_slice(&p.stark_commitment);
-        let mut commitment_val: u128 = 0;
-        for i in 0..16 { commitment_val |= (commitment_bytes[i] as u128) << (i * 8); }
-        let commitment_elem = BaseElement::new(commitment_val);
-        let nonce_elem = bytes_to_base_element(&p.elgamal_proof.nonce_bytes);
-        let pedersen_elem = bytes_to_base_element(p.elgamal_proof.pedersen_commit.0.as_bytes());
+        if !p.elgamal_proof.verify(&c1, &c2, &h, p.device_id, p.timestamp, &p.v_commit) {
+            return Err(AggError::InvalidProof("Schnorr failed".into()));
+        }
+        let v_commit_elem = BaseElement::new(u128::from_le_bytes(p.v_commit));
+        let resp_f_elem= BaseElement::new(u128::from_le_bytes(p.resp_f));
+        let c_f_elem= BaseElement::new(u128::from_le_bytes(p.c_f));
+        let pedersen_bytes: [u8; 32] = c2.compress().to_bytes();
+        let epsilon_elem = point_to_field_element(&pedersen_bytes);
         let stark_proof = Proof::from_bytes(&p.stark_proof[..]).map_err(|_| AggError::InvalidProof("bad STARK format".into()))?;
-        let pub_inputs = BinaryPublicInputs {state_commitment: commitment_elem,nonce_public: nonce_elem,pedersen_public: pedersen_elem};
+        let pub_inputs = BinaryPublicInputs {
+            v_commit: v_commit_elem,
+            epsilon:  epsilon_elem,
+            resp_f:   resp_f_elem,
+            c_f:      c_f_elem,
+            omega:    BaseElement::new(p.omega as u128),
+        };
         let min_opts = AcceptableOptions::MinConjecturedSecurity(95);
         verify::<BinaryAir, Blake3_256<BaseElement>, DefaultRandomCoin<Blake3_256<BaseElement>>, MerkleTree<Blake3_256<BaseElement>>>(stark_proof, pub_inputs, &min_opts).map_err(|_| AggError::InvalidProof("STARK verify failed".into()))?;
-        self.verified_ciphertexts.insert(p.device_id, VerifiedCiphertext {timestamp: p.timestamp,c1,c2,});
+        self.verified_ciphertexts.insert(p.device_id, VerifiedCiphertext {timestamp: p.timestamp, c1, c2});
         Ok(())
     }
     //Clean up old proofs and partials
@@ -417,13 +565,4 @@ impl IoTDevice {
         let verified_partials_vec: Vec<VerifiedPartial> = self.partials.values().cloned().collect();
         crate::common::compute_aggregate(self.threshold,&verified_vec,&verified_partials_vec)
     }
-}
-
-//Convert 32 bytes to field element using XOR of both halves
-pub fn bytes_to_base_element(bytes: &[u8; 32]) -> BaseElement {
-    let mut val: u128 = 0;
-    for i in 0..16 {
-        val |= ((bytes[i] ^ bytes[i+16]) as u128) << (i * 8);
-    }
-    BaseElement::new(val)
 }

@@ -44,3 +44,5 @@ It is structured as follows:
     |
     └───trusted_setup: Example KZG BN254_8 to use
             kzg_bn254_8.params
+
+Note: The OpenSSL dependency is required for the Azure Testing Scripts. This is notoriously finnicky depending on your device. If it is causes issues, one can simply comment out the dependency in the Cargo.toml. The core libraries, examples, and penetration test demonstrations do not require this dependency. 

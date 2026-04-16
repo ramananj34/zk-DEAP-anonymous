@@ -1,10 +1,8 @@
 [package]
 name = "zk-deap"
 version = "0.0.0"
-authors = ["Jude Ramanan"]
 edition = "2024"
 description = "Zero Knowledge Decentralized Encrypted Aggregation Protocol"
-repository = "https://github.com/ramananj34/zk-DEAP"
 
 [[bin]]
 name = "fixture_server"
@@ -68,6 +66,7 @@ halo2_gadgets = "0.3"
 winterfell = { version = "0.10", features = ["concurrent"] } #Winterfell
 winter-utils = "0.10" #Winterfell
 winter-prover = "0.10" #Winterfell
+blake3 = "1"
 
 #Azure Testing Packages
 actix-web = "4"
@@ -81,7 +80,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["blocking", "json"] }
 clap = { version = "4.4", features = ["derive"] }
 chrono = "0.4"
-openssl = { version = "0.10", features = ["vendored"] }
+#openssl = { version = "0.10", features = ["vendored"] }
 
 [profile.release]
 opt-level = 3
