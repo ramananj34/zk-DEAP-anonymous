@@ -81,7 +81,7 @@ struct BinaryConfig {
     rc_col: Column<Fixed>,
     s_mimc: Selector,
     s_row0: Selector,
-    instance: [Column<Instance>; 4],
+    instance: [Column<Instance>; 5],
 }
 //Circuit proving state is binary
 #[derive(Clone, Debug)]
@@ -107,7 +107,7 @@ impl Circuit<Halo2Fr> for BinaryCircuit {
         let rc_col = meta.fixed_column();
         let s_mimc = meta.selector();
         let s_row0 = meta.selector();
-        let instance = [meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column()];
+        let instance = [meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column()];
         for col in &advice { meta.enable_equality(*col); }
         for col in &instance { meta.enable_equality(*col); }
         let q_const_val = q_mod_r();
@@ -134,20 +134,24 @@ impl Circuit<Halo2Fr> for BinaryCircuit {
             ]
         });
         //Binary + Schnorr linear factored (row 0 only)
-        meta.create_gate("binary_and_schnorr", |meta| {
+        //Binary + linear Schnorr with explicit carry omega (row 0 only). Matches STARK construction exactly.
+        meta.create_gate("binary_schnorr_omega", |meta| {
             let sel = meta.query_selector(s_row0);
-            let s  = meta.query_advice(advice[0], Rotation::cur());
+            let s = meta.query_advice(advice[0], Rotation::cur());
             let vf = meta.query_advice(advice[1], Rotation::cur()); //m at row 0 = v_f
             let resp_f = meta.query_instance(instance[2], Rotation::cur());
-            let c_f    = meta.query_instance(instance[3], Rotation::cur());
+            let c_f = meta.query_instance(instance[3], Rotation::cur());
+            let omega = meta.query_instance(instance[4], Rotation::cur());
             let q_const = Expression::Constant(q_const_val);
             let one = Expression::Constant(Halo2Fr::ONE);
-            //Factored Schnorr: (resp_f - v_f - c_f*s) * (resp_f - v_f - c_f*s + q*s) = 0. Covers both wrap and no-wrap cases since r > 2q.
-            let diff = resp_f - vf - c_f * s.clone();
-            let diff_plus_qs = diff.clone() + q_const * s.clone();
+            //Linear Schnorr: resp_f = v_f + c_f*s - omega*q*s  (degree 2 in witnesses)
+            let schnorr = resp_f - vf - c_f * s.clone() + omega.clone() * q_const * s.clone();
+            //Range-check omega in {0,1} for binary domain (matches STARK's verifier check on omega)
+            let omega_bin = omega.clone() * (omega - one.clone());
             vec![
-                sel.clone() * s.clone() * (s - one), //binary (degree 2)
-                sel * diff * diff_plus_qs, //schnorr factored (degree 2)
+                sel.clone() * s.clone() * (s - one), //binary s (degree 2)
+                sel.clone() * schnorr, //linear Schnorr (degree 2)
+                sel * omega_bin, //omega in {0,1} (degree 2)
             ]
         });
         BinaryConfig { advice, rc_col, s_mimc, s_row0, instance }
@@ -290,6 +294,7 @@ pub struct DeviceProof {
     pub v_commit: [u8; 32], //MiMC output, embedded as Fr
     pub resp_f: [u8; 32], //Schnorr response embedded as Fr
     pub c_f: [u8; 32], //challenge embedded as Fr
+    pub omega: u8, //Schnorr wrap carry (0 or 1 for binary domain)
     pub halo2_proof: Vec<u8>,
     #[serde_as(as = "Bytes")]
     pub signature: [u8; 64],
@@ -365,9 +370,25 @@ impl IoTDevice {
         let mut v_commit_16 = [0u8; 16];
         v_commit_16.copy_from_slice(&v_commit_bytes32[..16]);
         //Schnorr proof with V_commit in transcript
+        //Schnorr proof with V_commit in transcript
         let (eg_proof, challenge) = ElGamalProof::prove_with_nonce(state, &r, &v, &c1, &c2, &h, self.id, ts, &v_commit_16);
         let resp_f = scalar_to_fr(&eg_proof.resp_state.0);
         let c_f    = scalar_to_fr(&challenge);
+        //omega: carry bit in {0,1}. For state=0 no addition happens so omega=0. For state=1, omega=1 iff v+c >= q as integers (i.e. the Schnorr sum wrapped mod q). Same computation as STARK.
+        let omega_byte: u8 = if state == 1 {
+            let sum = v + challenge;
+            let sum_b = sum.to_bytes();
+            let v_b = v.to_bytes();
+            let mut wrap = false;
+            for i in (0..32).rev() {
+                if sum_b[i] < v_b[i] { wrap = true; break; }
+                if sum_b[i] > v_b[i] { break; }
+            }
+            if wrap { 1u8 } else { 0u8 }
+        } else {
+            0u8
+        };
+        let omega_fr = Halo2Fr::from(omega_byte as u64);
         //Build circuit and prove
         let circuit = BinaryCircuit {
             state: Value::known(s_fr),
@@ -379,8 +400,9 @@ impl IoTDevice {
         let instance_eps = vec![epsilon];
         let instance_resp_f = vec![resp_f];
         let instance_c_f = vec![c_f];
+        let instance_omega = vec![omega_fr];
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
-        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.pk,&[circuit],&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..]]],OsRng,&mut transcript,).map_err(|e| { r.zeroize(); AggError::CryptoError(format!("Halo2 failed: {:?}", e)) })?;
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.pk,&[circuit],&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..], &instance_omega[..]]],OsRng,&mut transcript,).map_err(|e| { r.zeroize(); AggError::CryptoError(format!("Halo2 failed: {:?}", e)) })?;
         r.zeroize();
         let resp_f_bytes: [u8; 32] = resp_f.to_repr();
         let c_f_bytes:    [u8; 32] = c_f.to_repr();
@@ -399,6 +421,7 @@ impl IoTDevice {
         sig_data.extend_from_slice(&v_commit_bytes32);
         sig_data.extend_from_slice(&resp_f_bytes);
         sig_data.extend_from_slice(&c_f_bytes);
+        sig_data.push(omega_byte);
         let signature = self.sig_key.sign(&sig_data).to_bytes();
         Ok(DeviceProof {
             device_id: self.id, timestamp: ts,
@@ -408,6 +431,7 @@ impl IoTDevice {
             v_commit: v_commit_bytes32,
             resp_f: resp_f_bytes,
             c_f: c_f_bytes,
+            omega: omega_byte,
             halo2_proof: transcript.finalize(),
             signature,
         })
@@ -439,6 +463,9 @@ impl IoTDevice {
         if p.halo2_proof.len() > MAX_PROOF_SIZE {
             return Err(AggError::InvalidProof("Too big".into()));
         }
+        if p.omega > 1 {
+            return Err(AggError::InvalidProof("Bad omega".into()));
+        }
         if self.verified_ciphertexts.contains_key(&p.device_id) {
             return Err(AggError::InvalidProof("Duplicate".into()));
         }
@@ -458,6 +485,7 @@ impl IoTDevice {
         sig_data.extend_from_slice(&p.v_commit);
         sig_data.extend_from_slice(&p.resp_f);
         sig_data.extend_from_slice(&p.c_f);
+        sig_data.push(p.omega);
         let sig = Signature::try_from(&p.signature[..]).map_err(|_| AggError::InvalidProof("bad sig".into()))?;
         pk.verify(&sig_data, &sig).map_err(|_| AggError::InvalidProof("sig verify failed".into()))?;
         //ElGamal Schnorr (uses low 16 bytes of v_commit as transcript binding)
@@ -473,15 +501,17 @@ impl IoTDevice {
         let v_commit_fr = Halo2Fr::from_repr(p.v_commit).unwrap_or(Halo2Fr::ZERO);
         let resp_f_fr = Halo2Fr::from_repr(p.resp_f).unwrap_or(Halo2Fr::ZERO);
         let c_f_fr = Halo2Fr::from_repr(p.c_f).unwrap_or(Halo2Fr::ZERO);
+        let omega_fr = Halo2Fr::from(p.omega as u64);
         let pedersen_bytes: [u8; 32] = c2.compress().to_bytes();
         let epsilon_fr = point_to_fr(&pedersen_bytes);
         let instance_v_commit = vec![v_commit_fr];
         let instance_eps = vec![epsilon_fr];
         let instance_resp_f = vec![resp_f_fr];
         let instance_c_f = vec![c_f_fr];
+        let instance_omega = vec![omega_fr];
         let strategy = SingleStrategy::new(&self.halo2_setup.params);
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&p.halo2_proof[..]);
-        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'_, Bn256>, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.vk,strategy,&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..]]],&mut transcript,).map_err(|_| AggError::InvalidProof("Halo2 verify failed".into()))?;
+        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'_, Bn256>, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.vk,strategy,&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..], &instance_omega[..]]],&mut transcript,).map_err(|_| AggError::InvalidProof("Halo2 verify failed".into()))?;
         self.verified_ciphertexts.insert(p.device_id, VerifiedCiphertext {timestamp: p.timestamp, c1, c2});
         Ok(())
     }
