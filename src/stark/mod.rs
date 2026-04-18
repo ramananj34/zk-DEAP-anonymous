@@ -78,10 +78,9 @@ pub struct BinaryPublicInputs {
     pub epsilon: BaseElement,
     pub resp_f: BaseElement,
     pub c_f: BaseElement,
-    pub omega: BaseElement,
 }
 //Convert to linear array for STARK framework
-impl ToElements<BaseElement> for BinaryPublicInputs { fn to_elements(&self) -> Vec<BaseElement> { vec![self.v_commit, self.epsilon, self.resp_f, self.c_f, self.omega] } }
+impl ToElements<BaseElement> for BinaryPublicInputs { fn to_elements(&self) -> Vec<BaseElement> { vec![self.v_commit, self.epsilon, self.resp_f, self.c_f] } }
 //AIR Algebraic Intermediate Representation. This defines the constraint that state * (state - 1) = 0
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -91,7 +90,6 @@ pub struct BinaryAir {
     epsilon: BaseElement,
     resp_f: BaseElement,
     c_f: BaseElement,
-    omega: BaseElement,
     q_mod_p: BaseElement,
 }
 impl Air for BinaryAir {
@@ -100,14 +98,16 @@ impl Air for BinaryAir {
     type GkrProof = ();
     type GkrVerifier = ();
     fn new(trace_info: TraceInfo, pub_inputs: Self::PublicInputs, opts: ProofOptions) -> Self {
-        assert_eq!(5, trace_info.width());
+        assert_eq!(6, trace_info.width());
         let degrees = vec![
-            TransitionConstraintDegree::new(2), //C0 binary
+            TransitionConstraintDegree::new(2), //C0 binary s
             TransitionConstraintDegree::with_cycles(5, vec![TRACE_LENGTH]), //C1 MiMC (periodic rc)
             TransitionConstraintDegree::new(1), //C2 s constancy
             TransitionConstraintDegree::new(1), //C3 eps constancy
             TransitionConstraintDegree::new(1), //C4 b constancy
             TransitionConstraintDegree::new(1), //C5 schnorr aux
+            TransitionConstraintDegree::new(2), //C6 omega binary
+            TransitionConstraintDegree::new(1), //C7 omega constancy
         ];
         Self {
             context: AirContext::new(trace_info, degrees, 3, opts),
@@ -115,7 +115,6 @@ impl Air for BinaryAir {
             epsilon: pub_inputs.epsilon,
             resp_f: pub_inputs.resp_f,
             c_f: pub_inputs.c_f,
-            omega: pub_inputs.omega,
             q_mod_p: q_mod_p(),
         }
     }
@@ -125,14 +124,14 @@ impl Air for BinaryAir {
         let nxt = frame.next();
         let rc_i = periodic_values[0];
         let c_f = E::from(self.c_f);
-        let omega = E::from(self.omega);
         let q_mp = E::from(self.q_mod_p);
         let s = cur[0];
         let m = cur[1];
         let eps = cur[2];
         let b = cur[3];
         let aux = cur[4];
-        //C0: binary
+        let omega = cur[5];
+        //C0: binary s
         result[0] = s * (s - E::ONE);
         //C1: MiMC round  m_{i+1} = (m_i + s + eps + b + rc_i)^5
         let sum = m + s + eps + b + rc_i;
@@ -143,8 +142,12 @@ impl Air for BinaryAir {
         result[2] = nxt[0] - s;
         result[3] = nxt[2] - eps;
         result[4] = nxt[3] - b;
-        //C5: schnorr aux  T[4,i] = T[1,i] + c_f * T[0,i]
+        //C5: schnorr aux  T[4,i] = T[1,i] + c_f * T[0,i] - omega * q_mod_p
         result[5] = aux - m - c_f * s + omega * q_mp;
+        //C6: omega binary
+        result[6] = omega * (omega - E::ONE);
+        //C7: omega constancy
+        result[7] = nxt[5] - omega;
     }
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
         vec![Assertion::single(1, TRACE_LENGTH - 1, self.v_commit), Assertion::single(2, 0, self.epsilon), Assertion::single(4, 0, self.resp_f) ]
@@ -161,7 +164,6 @@ pub struct BinaryProver {
     last_epsilon: std::cell::Cell<Option<BaseElement>>,
     last_resp_f: std::cell::Cell<Option<BaseElement>>,
     last_c_f: std::cell::Cell<Option<BaseElement>>,
-    last_omega: std::cell::Cell<Option<BaseElement>>,
 }
 impl BinaryProver {
     pub fn new() -> Self {
@@ -171,7 +173,6 @@ impl BinaryProver {
             last_epsilon: std::cell::Cell::new(None),
             last_resp_f: std::cell::Cell::new(None),
             last_c_f: std::cell::Cell::new(None),
-            last_omega: std::cell::Cell::new(None),
         }
     }
     pub fn build_trace(&self, state: u8, v_f: BaseElement, epsilon: BaseElement, blinding: BaseElement, resp_f: BaseElement, c_f: BaseElement, omega: BaseElement) -> TraceTable<BaseElement> {
@@ -190,15 +191,15 @@ impl BinaryProver {
         self.last_epsilon.set(Some(epsilon));
         self.last_resp_f.set(Some(resp_f));
         self.last_c_f.set(Some(c_f));
-        self.last_omega.set(Some(omega));
-        let mut trace = TraceTable::new(5, TRACE_LENGTH);
+        let mut trace = TraceTable::new(6, TRACE_LENGTH);
         trace.fill(
             |row| {
                 row[0] = s_elem;
                 row[1] = v_f;
                 row[2] = epsilon;
                 row[3] = blinding;
-                row[4] = v_f + c_f * s_elem - omega * q_mp; //= resp_f at row 0
+                row[4] = v_f + c_f * s_elem - omega * q_mp;
+                row[5] = omega;
             },
             |step, row| {
                 let m_next = mimc[step + 1];
@@ -207,6 +208,7 @@ impl BinaryProver {
                 row[2] = epsilon;
                 row[3] = blinding;
                 row[4] = m_next + c_f * s_elem - omega * q_mp;
+                row[5] = omega;
             },
         );
         trace
@@ -228,7 +230,6 @@ impl Prover for BinaryProver {
             epsilon: self.last_epsilon.get().unwrap(),
             resp_f: self.last_resp_f.get().unwrap(),
             c_f: self.last_c_f.get().unwrap(),
-            omega: self.last_omega.get().unwrap(),
         }
     }
     fn options(&self) -> &ProofOptions { &self.options }
@@ -480,9 +481,6 @@ impl IoTDevice {
         if p.stark_proof.len() > MAX_PROOF_SIZE {
             return Err(AggError::InvalidProof("Too big".into()));
         }
-        if p.omega > 1 {
-            return Err(AggError::InvalidProof("Bad omega".into()));
-        }
         let pk = self.peer_keys.get(&p.device_id).ok_or(AggError::InvalidProof("Unknown device".into()))?;
         let mut sig_data = Vec::new();
         sig_data.extend_from_slice(&p.timestamp.to_le_bytes());
@@ -518,7 +516,6 @@ impl IoTDevice {
             epsilon:  epsilon_elem,
             resp_f:   resp_f_elem,
             c_f:      c_f_elem,
-            omega:    BaseElement::new(p.omega as u128),
         };
         let min_opts = AcceptableOptions::MinConjecturedSecurity(95);
         verify::<BinaryAir, Blake3_256<BaseElement>, DefaultRandomCoin<Blake3_256<BaseElement>>, MerkleTree<Blake3_256<BaseElement>>>(stark_proof, pub_inputs, &min_opts).map_err(|_| AggError::InvalidProof("STARK verify failed".into()))?;

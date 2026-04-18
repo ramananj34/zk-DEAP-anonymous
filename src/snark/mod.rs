@@ -77,11 +77,11 @@ pub fn load_kzg_params() -> Result<ParamsKZG<Bn256>, AggError> {
 //Halo2 circuit configuration
 #[derive(Clone, Debug)]
 struct BinaryConfig {
-    advice: [Column<Advice>; 4],
+    advice: [Column<Advice>; 5],
     rc_col: Column<Fixed>,
     s_mimc: Selector,
     s_row0: Selector,
-    instance: [Column<Instance>; 5],
+    instance: [Column<Instance>; 4],
 }
 //Circuit proving state is binary
 #[derive(Clone, Debug)]
@@ -90,24 +90,26 @@ struct BinaryCircuit {
     v_f: Value<Halo2Fr>,
     epsilon: Value<Halo2Fr>,
     blinding: Value<Halo2Fr>,
+    omega: Value<Halo2Fr>,
 }
 impl Circuit<Halo2Fr> for BinaryCircuit {
     type Config = BinaryConfig;
     type FloorPlanner = SimpleFloorPlanner;
     fn without_witnesses(&self) -> Self {
         Self {
-            state: Value::unknown(),
-            v_f: Value::unknown(),
-            epsilon: Value::unknown(),
-            blinding: Value::unknown(),
+        state: Value::unknown(),
+        v_f: Value::unknown(),
+        epsilon: Value::unknown(),
+        blinding: Value::unknown(),
+        omega: Value::unknown(),
         }
     }
     fn configure(meta: &mut ConstraintSystem<Halo2Fr>) -> Self::Config {
-        let advice = [meta.advice_column(), meta.advice_column(), meta.advice_column(), meta.advice_column()];
+        let advice = [meta.advice_column(), meta.advice_column(), meta.advice_column(), meta.advice_column(), meta.advice_column()];
         let rc_col = meta.fixed_column();
         let s_mimc = meta.selector();
         let s_row0 = meta.selector();
-        let instance = [meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column()];
+        let instance = [meta.instance_column(), meta.instance_column(), meta.instance_column(), meta.instance_column()];
         for col in &advice { meta.enable_equality(*col); }
         for col in &instance { meta.enable_equality(*col); }
         let q_const_val = q_mod_r();
@@ -141,7 +143,7 @@ impl Circuit<Halo2Fr> for BinaryCircuit {
             let vf = meta.query_advice(advice[1], Rotation::cur()); //m at row 0 = v_f
             let resp_f = meta.query_instance(instance[2], Rotation::cur());
             let c_f = meta.query_instance(instance[3], Rotation::cur());
-            let omega = meta.query_instance(instance[4], Rotation::cur());
+            let omega = meta.query_advice(advice[4], Rotation::cur());
             let q_const = Expression::Constant(q_const_val);
             let one = Expression::Constant(Halo2Fr::ONE);
             //Linear Schnorr: resp_f = v_f + c_f*s - omega*q  (degree 1 in witnesses)
@@ -186,6 +188,7 @@ impl Circuit<Halo2Fr> for BinaryCircuit {
                 let e_cell = region.assign_advice(|| format!("eps_{}", i), config.advice[2], i, || self.epsilon)?;
                 if i == 0 { eps_first = Some(e_cell); }
                 region.assign_advice(|| format!("b_{}", i), config.advice[3], i, || self.blinding)?;
+                region.assign_advice(|| format!("omega_{}", i), config.advice[4], i, || self.omega)?;
             }
             Ok((m_final.unwrap(), eps_first.unwrap()))
         })?;
@@ -207,7 +210,7 @@ pub struct Halo2Setup {
 //Setup Halo2
 pub fn setup_halo2() -> Result<Halo2Setup, AggError> {
     let params = load_kzg_params()?;
-    let empty_circuit = BinaryCircuit {state: Value::unknown(),v_f: Value::unknown(),epsilon: Value::unknown(),blinding: Value::unknown()};
+    let empty_circuit = BinaryCircuit {state: Value::unknown(),v_f: Value::unknown(),epsilon: Value::unknown(),blinding: Value::unknown(),omega: Value::unknown()};
     let vk = keygen_vk(&params, &empty_circuit).map_err(|e| AggError::CryptoError(format!("VK gen failed: {:?}", e)))?;
     let pk = keygen_pk(&params, vk.clone(), &empty_circuit).map_err(|e| AggError::CryptoError(format!("PK gen failed: {:?}", e)))?;
     Ok(Halo2Setup { params, pk, vk })
@@ -395,14 +398,14 @@ impl IoTDevice {
             v_f: Value::known(v_f),
             epsilon: Value::known(epsilon),
             blinding: Value::known(blinding),
+            omega: Value::known(omega_fr),
         };
         let instance_v_commit = vec![v_commit_fr];
         let instance_eps = vec![epsilon];
         let instance_resp_f = vec![resp_f];
         let instance_c_f = vec![c_f];
-        let instance_omega = vec![omega_fr];
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
-        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.pk,&[circuit],&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..], &instance_omega[..]]],OsRng,&mut transcript,).map_err(|e| { r.zeroize(); AggError::CryptoError(format!("Halo2 failed: {:?}", e)) })?;
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverSHPLONK<'_, Bn256>, _, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.pk,&[circuit],&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..]]],OsRng,&mut transcript,).map_err(|e| { r.zeroize(); AggError::CryptoError(format!("Halo2 failed: {:?}", e)) })?;
         r.zeroize();
         let resp_f_bytes: [u8; 32] = resp_f.to_repr();
         let c_f_bytes:    [u8; 32] = c_f.to_repr();
@@ -463,9 +466,6 @@ impl IoTDevice {
         if p.halo2_proof.len() > MAX_PROOF_SIZE {
             return Err(AggError::InvalidProof("Too big".into()));
         }
-        if p.omega > 1 {
-            return Err(AggError::InvalidProof("Bad omega".into()));
-        }
         if self.verified_ciphertexts.contains_key(&p.device_id) {
             return Err(AggError::InvalidProof("Duplicate".into()));
         }
@@ -501,17 +501,15 @@ impl IoTDevice {
         let v_commit_fr = Halo2Fr::from_repr(p.v_commit).unwrap_or(Halo2Fr::ZERO);
         let resp_f_fr = Halo2Fr::from_repr(p.resp_f).unwrap_or(Halo2Fr::ZERO);
         let c_f_fr = Halo2Fr::from_repr(p.c_f).unwrap_or(Halo2Fr::ZERO);
-        let omega_fr = Halo2Fr::from(p.omega as u64);
         let pedersen_bytes: [u8; 32] = c2.compress().to_bytes();
         let epsilon_fr = point_to_fr(&pedersen_bytes);
         let instance_v_commit = vec![v_commit_fr];
         let instance_eps = vec![epsilon_fr];
         let instance_resp_f = vec![resp_f_fr];
         let instance_c_f = vec![c_f_fr];
-        let instance_omega = vec![omega_fr];
         let strategy = SingleStrategy::new(&self.halo2_setup.params);
         let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(&p.halo2_proof[..]);
-        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'_, Bn256>, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.vk,strategy,&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..], &instance_omega[..]]],&mut transcript,).map_err(|_| AggError::InvalidProof("Halo2 verify failed".into()))?;
+        verify_proof::<KZGCommitmentScheme<Bn256>, VerifierSHPLONK<'_, Bn256>, _, _, _>(&self.halo2_setup.params,&self.halo2_setup.vk,strategy,&[&[&instance_v_commit[..], &instance_eps[..], &instance_resp_f[..], &instance_c_f[..]]],&mut transcript,).map_err(|_| AggError::InvalidProof("Halo2 verify failed".into()))?;
         self.verified_ciphertexts.insert(p.device_id, VerifiedCiphertext {timestamp: p.timestamp, c1, c2});
         Ok(())
     }
