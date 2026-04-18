@@ -144,8 +144,8 @@ impl Circuit<Halo2Fr> for BinaryCircuit {
             let omega = meta.query_instance(instance[4], Rotation::cur());
             let q_const = Expression::Constant(q_const_val);
             let one = Expression::Constant(Halo2Fr::ONE);
-            //Linear Schnorr: resp_f = v_f + c_f*s - omega*q*s  (degree 2 in witnesses)
-            let schnorr = resp_f - vf - c_f * s.clone() + omega.clone() * q_const * s.clone();
+            //Linear Schnorr: resp_f = v_f + c_f*s - omega*q  (degree 1 in witnesses)
+            let schnorr = resp_f - vf - c_f * s.clone() + omega.clone() * q_const;
             //Range-check omega in {0,1} for binary domain (matches STARK's verifier check on omega)
             let omega_bin = omega.clone() * (omega - one.clone());
             vec![

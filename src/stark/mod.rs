@@ -144,7 +144,7 @@ impl Air for BinaryAir {
         result[3] = nxt[2] - eps;
         result[4] = nxt[3] - b;
         //C5: schnorr aux  T[4,i] = T[1,i] + c_f * T[0,i]
-        result[5] = aux - m - c_f * s + omega * q_mp * s;
+        result[5] = aux - m - c_f * s + omega * q_mp;
     }
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
         vec![Assertion::single(1, TRACE_LENGTH - 1, self.v_commit), Assertion::single(2, 0, self.epsilon), Assertion::single(4, 0, self.resp_f) ]
@@ -198,7 +198,7 @@ impl BinaryProver {
                 row[1] = v_f;
                 row[2] = epsilon;
                 row[3] = blinding;
-                row[4] = v_f + c_f * s_elem - omega * q_mp * s_elem; //= resp_f at row 0
+                row[4] = v_f + c_f * s_elem - omega * q_mp; //= resp_f at row 0
             },
             |step, row| {
                 let m_next = mimc[step + 1];
@@ -206,7 +206,7 @@ impl BinaryProver {
                 row[1] = m_next;
                 row[2] = epsilon;
                 row[3] = blinding;
-                row[4] = m_next + c_f * s_elem - omega * q_mp * s_elem;
+                row[4] = m_next + c_f * s_elem - omega * q_mp;
             },
         );
         trace
